@@ -5,7 +5,15 @@ from PyQt6.QtWidgets import (
     QMessageBox, QCheckBox, QGroupBox, QFormLayout
 )
 from PyQt6.QtCore import Qt
-from FATSimulador import FATSimulador, Usuario
+
+from InterfacesFAT import (
+    Usuario, ServicioAutenticacion, LectorArchivos, EditorArchivos, 
+    GestorPapelera, GestorPermisos, PoliticaPermisos
+)
+from InfraestructuraFAT import (
+    RepositorioFATJson, AlmacenamientoBloquesJson, PoliticaPermisosBasica, AutenticadorBasico
+)
+from FATSimulador import FATSimulador
 
 BEIGE_CLARO = "#DBAFA0"
 ROSA_MALVA = "#BB8493"
@@ -15,14 +23,48 @@ TEXTO_CLARO = "#FFFFFF"
 TEXTO_OSCURO = "#000000"
 
 
-class VentanaLogin(QMainWindow):
-    CREDENCIALES = {
-        "usuario_prueba": ("1234", False),
-        "admin": ("123", True)
-    }
+class FormateadorDetalleFAT:
+    @staticmethod
+    def formatear(fat_entry, contenido, usuario_actual, politica: PoliticaPermisos) -> tuple[str, bool]:
+        if not fat_entry:
+            return "Error al cargar metadatos.", False
 
-    def __init__(self):
+        puede_escribir = politica.puede_escribir(usuario_actual.nombre, fat_entry)
+        puede_leer = politica.puede_leer(usuario_actual.nombre, fat_entry)
+        es_admin = politica.es_admin(usuario_actual.nombre)
+
+        detalle = f"--- METADATOS FAT ---\n"
+        detalle += f"Archivo: {fat_entry['nombre']}\n"
+        detalle += f"Owner: {fat_entry['owner']}\n"
+        detalle += f"ESTADO: {'EN PAPELERA' if fat_entry.get('papelera') else 'ACTIVO'}\n"
+        detalle += f"Tamaño: {fat_entry.get('caracteres_total', 0)} caracteres\n"
+        fecha_mod = fat_entry.get('fecha_modificacion', '')
+        detalle += f"Modificación: {fecha_mod[:19].replace('T', ' ')}\n"
+
+        if es_admin:
+            detalle += f"Tus Permisos: L=True, E=True (Admin Total)\n"
+        else:
+            detalle += f"Tus Permisos: L={puede_leer}, E={puede_escribir}\n"
+
+        if contenido and not isinstance(contenido, str):
+            detalle += "\n--- CONTENIDO ---\n"
+            detalle += contenido
+        elif isinstance(contenido, str) and "Acceso denegado" in contenido:
+            detalle += f"\n--- Contenido (Acceso Denegado) ---\n"
+            detalle += contenido
+        else:
+            if not puede_leer:
+                detalle += "\n--- No se pudo cargar el contenido (Sin permisos de lectura) ---\n"
+
+        return detalle, puede_escribir
+
+
+class VentanaLogin(QMainWindow):
+    def __init__(self, servicio_autenticacion: ServicioAutenticacion, on_login_success):
         super().__init__()
+        self.servicio_autenticacion = servicio_autenticacion
+        self.on_login_success = on_login_success
+        
         self.setWindowTitle("Sistema FAT - Iniciar Sesión")
         self.setGeometry(500, 300, 400, 250)
         self.setStyleSheet(self._get_login_style())
@@ -62,7 +104,6 @@ class VentanaLogin(QMainWindow):
                 padding: 12px; font-weight: bold; border-radius: 6px; margin-top: 15px;
             }}
             QPushButton#BotonLogin:hover {{ background-color: {BEIGE_CLARO}; }}
-
             QMessageBox {{ 
                 background-color: {MORADO_OSCURO_FONDO}; 
                 color: {TEXTO_CLARO}; 
@@ -73,24 +114,29 @@ class VentanaLogin(QMainWindow):
         usuario_str = self.txt_usuario.text().strip()
         password_str = self.txt_password.text()
 
-        if usuario_str in self.CREDENCIALES:
-            password_correcta, es_owner = self.CREDENCIALES[usuario_str]
+        usuario_logueado = self.servicio_autenticacion.autenticar(usuario_str, password_str)
 
-            if password_str == password_correcta:
-                usuario_logueado = Usuario(usuario_str, es_owner=es_owner)
-
-                self.hide()
-                self.ventana_principal = VentanaFAT(usuario_logueado)
-                self.ventana_principal.show()
-                return
-
-        QMessageBox.critical(self, "Error de Login", "Credenciales incorrectas. Intente de nuevo.")
+        if usuario_logueado:
+            self.hide()
+            self.on_login_success(usuario_logueado)
+        else:
+            QMessageBox.critical(self, "Error de Login", "Credenciales incorrectas. Intente de nuevo.")
 
 
 class VentanaFAT(QMainWindow):
-    def __init__(self, usuario_logueado):
+    def __init__(self, 
+                 lector: LectorArchivos, 
+                 editor: EditorArchivos, 
+                 papelera: GestorPapelera, 
+                 permisos: GestorPermisos, 
+                 politica: PoliticaPermisos,
+                 usuario_logueado: Usuario):
         super().__init__()
-        self.simulador_fat = FATSimulador()
+        self.lector = lector
+        self.editor = editor
+        self.papelera = papelera
+        self.permisos = permisos
+        self.politica = politica
         self.usuario_actual = usuario_logueado
 
         self.setWindowTitle(f"Simulador de Archivos FAT - Logueado como: {self.usuario_actual.nombre}")
@@ -108,7 +154,6 @@ class VentanaFAT(QMainWindow):
         main_layout.addWidget(self.vistas_panel, 2)
 
         self.aplicar_restricciones_rol()
-
         self.cargar_lista_activa()
 
         self.btn_crear.clicked.connect(self.crear_archivo)
@@ -123,7 +168,9 @@ class VentanaFAT(QMainWindow):
         self.btn_asignar_permisos.clicked.connect(self.asignar_permisos_ui)
 
     def aplicar_restricciones_rol(self):
-        if not self.usuario_actual.es_owner:
+        # Utilizamos la política para decidir qué mostrar
+        es_admin = self.politica.es_admin(self.usuario_actual.nombre)
+        if not es_admin:
             self.grp_control.hide()
             self.grp_permisos.hide()
             self.btn_crear.setDisabled(True)
@@ -146,7 +193,6 @@ class VentanaFAT(QMainWindow):
                 color: {TEXTO_CLARO};
             }}
             QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top center; padding: 0 5px; color: {BEIGE_CLARO}; }}
-
             QListWidget, QTextEdit, QLineEdit {{
                 border: 1px solid {ROSA_MALVA}; 
                 padding: 8px; 
@@ -155,29 +201,21 @@ class VentanaFAT(QMainWindow):
                 selection-background-color: {ROSA_MALVA};
                 selection-color: {TEXTO_OSCURO};
             }}
-
             QListWidget {{ padding: 0px; }} 
-
             QPushButton {{
                 background-color: {ROSA_MALVA}; color: {TEXTO_OSCURO}; border: none;
                 padding: 12px; font-weight: bold; border-radius: 6px; margin-bottom: 5px;
             }}
             QPushButton:hover {{ background-color: {BEIGE_CLARO}; color: {TEXTO_OSCURO}; }}
-
             #BotonCrear {{ background-color: {ROSA_MALVA}; color: {TEXTO_OSCURO}; }}
             #BotonCrear:hover {{ background-color: {BEIGE_CLARO}; }}
-
             #BotonEliminar {{ background-color: {MORADO_OSCURO_FONDO}; color: {TEXTO_CLARO}; border: 1px solid {BEIGE_CLARO}; }}
             #BotonEliminar:hover {{ background-color: {ROSA_MALVA}; }}
-
             #BotonListarPapelera {{ background-color: {MORADO_MUY_OSCURO}; color: {TEXTO_CLARO}; border: 1px solid {ROSA_MALVA};}} 
             #BotonListarPapelera:hover {{ background-color: {ROSA_MALVA}; }}
-
             #BotonRecuperar {{ background-color: {BEIGE_CLARO}; color: {TEXTO_OSCURO}; }} 
             #BotonRecuperar:hover {{ background-color: {ROSA_MALVA}; }}
-
             QCheckBox {{ color: {TEXTO_CLARO}; }}
-
             QMessageBox {{ background-color: {MORADO_MUY_OSCURO}; color: {TEXTO_CLARO}; }}
             QMessageBox QPushButton {{ background-color: {ROSA_MALVA}; color: {TEXTO_OSCURO}; }}
         """
@@ -190,7 +228,6 @@ class VentanaFAT(QMainWindow):
         lay_control = QHBoxLayout(self.grp_control)
         self.lbl_usuario = QLabel(f"Usuario Logueado: {self.usuario_actual.nombre}")
         lay_control.addWidget(self.lbl_usuario)
-
         layout.addWidget(self.grp_control)
 
         self.grp_crear = QGroupBox("1. Crear Archivo")
@@ -209,7 +246,6 @@ class VentanaFAT(QMainWindow):
 
         self.grp_permisos = QGroupBox("2. Gestión de Permisos (ADMIN ONLY)")
         lay_permisos = QVBoxLayout(self.grp_permisos)
-
         lay_permisos.addWidget(QLabel("Seleccionar Archivo:"))
         self.list_permisos_archivo = QListWidget()
         self.list_permisos_archivo.setMinimumHeight(100)
@@ -281,7 +317,7 @@ class VentanaFAT(QMainWindow):
         self.list_papelera.clear()
         self.cargar_lista_papelera(False)
 
-        archivos = self.simulador_fat.listar_archivos(mostrar_papelera=False)
+        archivos = self.lector.listar_archivos(mostrar_papelera=False)
         for fat_entry in archivos:
             nombre = fat_entry['nombre']
             self.list_activa.addItem(nombre)
@@ -296,7 +332,7 @@ class VentanaFAT(QMainWindow):
             self.list_permisos_archivo.clearSelection()
             self.txt_detalle.clear()
 
-            archivos = self.simulador_fat.listar_archivos(mostrar_papelera=True)
+            archivos = self.lector.listar_archivos(mostrar_papelera=True)
             for fat_entry in archivos:
                 self.list_papelera.addItem(fat_entry['nombre'])
 
@@ -322,8 +358,7 @@ class VentanaFAT(QMainWindow):
 
         owner_creacion = self.usuario_actual.nombre
 
-        mensaje, exito = self.simulador_fat.crear_archivo(nombre, contenido, owner_creacion)
-
+        mensaje, exito = self.editor.crear_archivo(nombre, contenido, owner_creacion)
         QMessageBox.information(self, "Creación de Archivo", mensaje)
 
         if exito:
@@ -333,55 +368,21 @@ class VentanaFAT(QMainWindow):
 
     def mostrar_detalle(self, item, es_papelera):
         nombre_archivo = item.text()
+        contenido, fat_entry = self.lector.abrir_archivo(nombre_archivo, self.usuario_actual.nombre)
 
-        contenido, fat_entry = self.simulador_fat.abrir_archivo(nombre_archivo, self.usuario_actual.nombre)
+        detalle, puede_escribir = FormateadorDetalleFAT.formatear(
+            fat_entry, contenido, self.usuario_actual, self.politica
+        )
 
-        self.txt_contenido.setReadOnly(True)
+        self.txt_detalle.setText(detalle)
 
-        if fat_entry:
-            permisos_usuarios = fat_entry.get('permisos_usuarios', {})
-            permisos_usuario_actual = permisos_usuarios.get(self.usuario_actual.nombre,
-                                                            {"lectura": False, "escritura": False})
-
-            detalle = f"--- METADATOS FAT ---\n"
-            detalle += f"Archivo: {fat_entry['nombre']}\n"
-            detalle += f"Owner: {fat_entry['owner']}\n"
-            detalle += f"ESTADO: {'EN PAPELERA' if fat_entry['papelera'] else 'ACTIVO'}\n"
-            detalle += f"Tamaño: {fat_entry['caracteres_total']} caracteres\n"
-            detalle += f"Modificación: {fat_entry['fecha_modificacion'][:19].replace('T', ' ')}\n"
-
-            puede_escribir = False
-            if self.usuario_actual.nombre == "admin":
-                detalle += f"Tus Permisos: L=True, E=True (Admin Total)\n"
-                puede_escribir = True
-            else:
-                detalle += f"Tus Permisos: L={permisos_usuario_actual['lectura']}, E={permisos_usuario_actual['escritura']}\n"
-                if permisos_usuario_actual['escritura']:
-                    puede_escribir = True
-
-            if puede_escribir:
-                self.txt_contenido.setReadOnly(False)
-                self.txt_contenido.clear()
-                self.txt_contenido.setPlaceholderText(
-                    f"Ingrese el NUEVO contenido para modificar '{nombre_archivo}' aquí.")
-            else:
-                self.txt_contenido.setReadOnly(True)
-                self.txt_contenido.setPlaceholderText("No tiene permiso de escritura para modificar este archivo.")
-
-            if contenido and not isinstance(contenido, str):
-                detalle += "\n--- CONTENIDO ---\n"
-                detalle += contenido
-            elif isinstance(contenido, str) and "Acceso denegado" in contenido:
-                detalle += f"\n--- Contenido (Acceso Denegado) ---\n"
-                detalle += contenido
-            else:
-                detalle += "\n--- No se pudo cargar el contenido ---\n"
-
-            self.txt_detalle.setText(detalle)
+        if puede_escribir:
+            self.txt_contenido.setReadOnly(False)
+            self.txt_contenido.clear()
+            self.txt_contenido.setPlaceholderText(f"Ingrese el NUEVO contenido para modificar '{nombre_archivo}' aquí.")
         else:
-            self.txt_detalle.setText("Error al cargar metadatos.")
             self.txt_contenido.setReadOnly(True)
-            self.txt_contenido.setPlaceholderText("No hay archivo seleccionado.")
+            self.txt_contenido.setPlaceholderText("No tiene permiso de escritura para modificar este archivo.")
 
     def abrir_archivo(self):
         try:
@@ -390,10 +391,9 @@ class VentanaFAT(QMainWindow):
             QMessageBox.warning(self, "Error", "Seleccione un archivo activo para abrir.")
             return
 
-        contenido, fat_entry = self.simulador_fat.abrir_archivo(nombre_archivo, self.usuario_actual.nombre)
+        contenido, fat_entry = self.lector.abrir_archivo(nombre_archivo, self.usuario_actual.nombre)
 
-        if isinstance(contenido, str) and (
-                "Acceso denegado" in contenido or "Error: Archivo no encontrado" in contenido):
+        if isinstance(contenido, str) and ("Acceso denegado" in contenido or "Error: Archivo no encontrado" in contenido):
             QMessageBox.critical(self, "Error de Apertura", contenido)
         elif isinstance(contenido, str):
             QMessageBox.information(self, f"Contenido de '{nombre_archivo}'", contenido, QMessageBox.StandardButton.Ok)
@@ -408,13 +408,11 @@ class VentanaFAT(QMainWindow):
             return
 
         nuevo_contenido = self.txt_contenido.toPlainText()
-
         if not nuevo_contenido:
-            QMessageBox.warning(self, "Advertencia",
-                                "Ingrese el nuevo contenido en el área de 'Contenido' a la izquierda.")
+            QMessageBox.warning(self, "Advertencia", "Ingrese el nuevo contenido en el área de 'Contenido' a la izquierda.")
             return
 
-        mensaje = self.simulador_fat.modificar_archivo(nombre_archivo, nuevo_contenido, self.usuario_actual.nombre)
+        mensaje = self.editor.modificar_archivo(nombre_archivo, nuevo_contenido, self.usuario_actual.nombre)
 
         if "Acceso denegado" in mensaje:
             QMessageBox.critical(self, "Modificación Denegada", mensaje)
@@ -431,8 +429,7 @@ class VentanaFAT(QMainWindow):
             QMessageBox.warning(self, "Error", "Seleccione un archivo activo para mover a la papelera.")
             return
 
-        mensaje = self.simulador_fat.eliminar_archivo(nombre_archivo)
-
+        mensaje = self.papelera.eliminar_archivo(nombre_archivo)
         QMessageBox.information(self, "Eliminación", mensaje)
         self.cargar_lista_activa()
 
@@ -443,10 +440,8 @@ class VentanaFAT(QMainWindow):
             QMessageBox.warning(self, "Error", "Seleccione un archivo de la papelera para recuperar.")
             return
 
-        mensaje = self.simulador_fat.recuperar_archivo(nombre_archivo)
-
+        mensaje = self.papelera.recuperar_archivo(nombre_archivo)
         QMessageBox.information(self, "Recuperación", mensaje)
-
         self.cargar_lista_activa()
         self.cargar_lista_papelera(True)
 
@@ -466,12 +461,12 @@ class VentanaFAT(QMainWindow):
         lectura = self.chk_lectura.isChecked()
         escritura = self.chk_escritura.isChecked()
 
-        if self.usuario_actual.nombre != "admin":
+        if not self.politica.es_admin(self.usuario_actual.nombre):
             QMessageBox.critical(self, "Error de Permisos",
                                  "Acceso Denegado: Solo el usuario 'admin' puede asignar o revocar permisos.")
             return
 
-        mensaje = self.simulador_fat.asignar_permisos(
+        mensaje = self.permisos.asignar_permisos(
             nombre_archivo,
             usuario_a_modificar,
             lectura,
@@ -483,7 +478,7 @@ class VentanaFAT(QMainWindow):
         self.cargar_lista_activa()
 
 
-if __name__ == "__main__":
+def main():
     try:
         QApplication.setStyle(QStyleFactory.create("Fusion"))
     except:
@@ -491,7 +486,32 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
 
-    login_window = VentanaLogin()
+    # Inyección de dependencias (Composición / Assembler)
+    repositorio = RepositorioFATJson()
+    almacenamiento = AlmacenamientoBloquesJson()
+    politica = PoliticaPermisosBasica()
+    autenticador = AutenticadorBasico()
+
+    servicio_fat = FATSimulador(repositorio, almacenamiento, politica)
+
+    ventana_principal = None
+
+    def on_login(usuario_logueado):
+        nonlocal ventana_principal
+        ventana_principal = VentanaFAT(
+            lector=servicio_fat,
+            editor=servicio_fat,
+            papelera=servicio_fat,
+            permisos=servicio_fat,
+            politica=politica,
+            usuario_logueado=usuario_logueado
+        )
+        ventana_principal.show()
+
+    login_window = VentanaLogin(autenticador, on_login)
     login_window.show()
 
     sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
